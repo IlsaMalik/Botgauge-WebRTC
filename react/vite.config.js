@@ -6,9 +6,10 @@ export default defineConfig({
   server: {
     proxy: {
       "/sessions": {
-        target: "http://localhost:8081",
+        target:       "http://localhost:8081",
         changeOrigin: true,
-        secure: false,
+        secure:       false,
+        ws:           true,
       },
     },
   },

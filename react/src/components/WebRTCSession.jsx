@@ -1,63 +1,136 @@
 import { useState, useEffect, useRef } from "react";
-import { PeerSession } from "../lib/peerSession.js";
-import { ReconnectManager } from "../lib/reconnectManager.js";
+import { PeerSession }        from "../lib/peerSession.js";
+import { ReconnectManager }   from "../lib/reconnectManager.js";
 import { attachInputCapture } from "../lib/inputCapture.js";
 
 const BASE = "";
+
+let sessionStarted = false;
+
 async function fetchToken() {
-  const res = await fetch(`${BASE}/sessions/demo-token?user_id=demo-user-1`);
+  const res  = await fetch(`${BASE}/sessions/demo-token?user_id=demo-user-1`);
   const data = await res.json();
-  return (data.token || "").replace(/^Bearer\s+/i, "").trim();
+  console.log("[fetchToken] Raw response:", data);
+  const token = (data.token || "").replace(/^Bearer\s+/i, "").trim();
+  console.log("[fetchToken] Cleaned token (first 20 chars):", token.slice(0, 20) + "...");
+  return token;
 }
 
 async function createSession(jwt) {
+  console.log("[createSession] Creating session with JWT (first 20):", jwt.slice(0, 20) + "...");
   const res = await fetch(`${BASE}/sessions`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${jwt}`,
-      "Content-Type": "application/json",
+      "Content-Type":  "application/json",
     },
     body: JSON.stringify({ metadata: { source: "frontend" }, diagnostic: false }),
   });
+  if (!res.ok) {
+    const msg = await res.text().catch(() => "");
+    throw new Error(`create session failed: ${res.status} ${msg}`.trim());
+  }
   const data = await res.json();
+  console.log("[createSession] Response:", data);
+  console.log("[createSession] session_id:", data.session_id);
   return data.session_id;
 }
 
 async function fetchBootstrap(sessionId, jwt) {
+  console.log("[fetchBootstrap] Fetching for session:", sessionId);
   const res = await fetch(
-    `${BASE}/sessions/${sessionId}/bootstrap?token=${jwt}`,
-    { method: "POST" }
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/bootstrap?token=${encodeURIComponent(jwt)}`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${jwt}`,
+        "Content-Type":  "application/json",
+      },
+      body: JSON.stringify({ session_id: sessionId }),
+    }
   );
+  if (!res.ok) {
+    const msg = await res.text().catch(() => "");
+    throw new Error(`bootstrap failed: ${res.status} ${msg}`.trim());
+  }
   return await res.json();
 }
 
-async function waitForReady(sessionId, jwt) {
-  const timeoutMs = 20000;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const res = await fetch(`/sessions/${sessionId}`, {
-      headers: { "Authorization": `Bearer ${jwt}` },
+async function reportNetworkClass(sessionId, jwt, stageName) {
+  const classMap = {
+    direct: { network_class: "direct_udp", attempt_mode: "all"        },
+    stun:   { network_class: "direct_udp", attempt_mode: "all"        },
+    turn:   { network_class: "relay_udp",  attempt_mode: "relay_only" },
+  };
+  const payload = classMap[stageName] ?? { network_class: "failed", attempt_mode: "all" };
+  try {
+    await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/network-class`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${jwt}`,
+        "Content-Type":  "application/json",
+      },
+      body: JSON.stringify({ session_id: sessionId, ...payload }),
     });
-    if (res.ok) {
-      const data = await res.json();
-      const state = data.state || data.session_state || "";
-      if (state === "READY" || state === "ACTIVE") return;
-      if (state === "FAILED") throw new Error("Pod failed to start");
-    }
-    await new Promise((r) => setTimeout(r, 2000));
+  } catch (e) {
+    console.warn("network-class report failed (non-critical):", e.message);
   }
-  throw new Error("Pod not ready (timeout)");
+}
+
+function buildPlans(attemptPolicy, globalIceServers = []) {
+  if (Array.isArray(attemptPolicy) && attemptPolicy.length > 0) {
+    return attemptPolicy.map((stage) => {
+      const stageName = String(stage.stageName || "").toLowerCase();
+      let iceServers  = Array.isArray(stage.iceServers) ? stage.iceServers : globalIceServers;
+
+      if (stageName === "direct") {
+        iceServers = [];
+      } else if (stageName === "stun") {
+        iceServers = iceServers.filter((s) =>
+          [s.urls].flat().some((u) => String(u).startsWith("stun:"))
+        );
+      } else if (stageName === "turn") {
+        iceServers = iceServers.filter((s) =>
+          [s.urls].flat().some((u) => /^turns?:/.test(String(u)))
+        );
+      }
+
+      return {
+        stageName,
+        iceServers,
+        iceTransportPolicy: stage.iceTransportPolicy === "relay" ? "relay" : "all",
+        timeoutMs:          Number(stage.timeoutMs) || 15000,
+      };
+    });
+  }
+
+  const stunServers = globalIceServers.filter((s) =>
+    [s.urls].flat().some((u) => String(u).startsWith("stun:"))
+  );
+  const turnServers = globalIceServers.filter((s) =>
+    [s.urls].flat().some((u) => /^turns?:/.test(String(u)))
+  );
+
+  console.log("[buildPlans] Using default 3-stage plan (no attemptPolicy from server)");
+  console.log("[buildPlans] stunServers:", stunServers);
+  console.log("[buildPlans] turnServers:", turnServers);
+
+  return [
+    { stageName: "direct", iceServers: [],         iceTransportPolicy: "all",   timeoutMs: 8000  },
+    { stageName: "stun",   iceServers: stunServers, iceTransportPolicy: "all",   timeoutMs: 12000 },
+    { stageName: "turn",   iceServers: turnServers, iceTransportPolicy: "relay", timeoutMs: 20000 },
+  ];
 }
 
 export default function WebRTCSession() {
-  const [status, setStatus]             = useState("Initializing...");
-  const [isError, setIsError]           = useState(false);
-  const [isReady, setIsReady]           = useState(false);
-  const [isMuted, setIsMuted]           = useState(true);
+  const [status,       setStatus]       = useState("Initializing...");
+  const [isError,      setIsError]      = useState(false);
+  const [isReady,      setIsReady]      = useState(false);
+  const [isMuted,      setIsMuted]      = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [sessionId, setSessionId]       = useState(null);
-  const [duration, setDuration]         = useState(0);
-  const [metrics, setMetrics]           = useState({
+  const [sessionId,    setSessionId]    = useState(null);
+  const [duration,     setDuration]     = useState(0);
+  const [metrics,      setMetrics]      = useState({
     fps: 0, bitrate: 0, packetsLost: 0,
     jitter: 0, connectionState: "new", iceState: "new",
   });
@@ -68,26 +141,24 @@ export default function WebRTCSession() {
   const cleanupRef   = useRef(null);
   const managerRef   = useRef(null);
   const pcRef        = useRef(null);
+  const jwtRef       = useRef(null);
 
   useEffect(() => {
     if (!isReady) return;
     const timer = setInterval(() => setDuration((d) => d + 1), 1000);
     return () => clearInterval(timer);
   }, [isReady]);
-  useEffect(() => {
-  const handleBeforeUnload = () => {
-    sessionRef.current?.stop();
-  };
-  window.addEventListener("beforeunload", handleBeforeUnload);
-  return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-}, []);
 
+  useEffect(() => {
+    const handleBeforeUnload = () => sessionRef.current?.stop();
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
 
   useEffect(() => {
     if (!isReady || !pcRef.current) return;
     let prevBytes = 0;
     let prevTime  = Date.now();
-
     const interval = setInterval(async () => {
       if (!pcRef.current) return;
       const report = await pcRef.current.getStats();
@@ -103,50 +174,69 @@ export default function WebRTCSession() {
             bitrate:         Math.round((diff * 8) / elapsed / 1000),
             packetsLost:     stat.packetsLost ?? 0,
             jitter:          Math.round((stat.jitter ?? 0) * 1000),
-            connectionState: pcRef.current?.connectionState ?? "—",
+            connectionState: pcRef.current?.connectionState    ?? "—",
             iceState:        pcRef.current?.iceConnectionState ?? "—",
           });
         }
       });
     }, 2000);
-
     return () => clearInterval(interval);
   }, [isReady]);
 
   useEffect(() => {
+    if (sessionStarted) return;
+    sessionStarted = true;
+
     async function startSession() {
-        cleanupRef.current?.();
-  sessionRef.current?.stop();
-  pcRef.current = null;
-      try {
-        setIsError(false);
+      cleanupRef.current?.();
+      sessionRef.current?.stop();
+      pcRef.current = null;
 
-        setStatus("Getting token...");
-        const jwt = await fetchToken();
+      setIsError(false);
+      setIsReady(false);
 
-        setStatus("Creating session...");
-        const sid = await createSession(jwt);
-        setSessionId(sid);
+      setStatus("Creating session...");
+      const jwt = await fetchToken();
+      jwtRef.current = jwt;
+      const sid = await createSession(jwt);
+      setSessionId(sid);
 
-        setStatus("Fetching bootstrap...");
-        const boot = await fetchBootstrap(sid, jwt);
-        const signalingUrl = boot.signalingUrl || boot.signaling_url;
-        const iceServers   = boot.iceServers   || boot.ice_servers || [];
+      setStatus("Fetching bootstrap...");
+      const boot = await fetchBootstrap(sid, jwt);
 
-        setStatus("Waiting for pod...");
-        await waitForReady(sid, jwt);
+      const rawSignalingUrl = boot.signalingUrl  || boot.signaling_url;
+      const globalIce       = boot.iceServers    || boot.ice_servers
+                           || boot.ice?.iceServers || [];
+      const attemptPolicy   = boot.attemptPolicy || boot.attempt_policy || [];
 
-        setStatus("Connecting...");
+      if (!rawSignalingUrl) throw new Error("Bootstrap missing signalingUrl");
 
-        const session = new PeerSession(signalingUrl, iceServers);
+      // Auto-fix http → ws, https → wss
+      const signalingUrl = rawSignalingUrl.replace(/^http/, "ws");
+      if (signalingUrl !== rawSignalingUrl) {
+        console.warn("[startSession] ⚠️ signalingUrl was http — auto-converted to ws:", signalingUrl);
+      }
+      console.log("[startSession] Final signalingUrl:", signalingUrl);
+      console.log("[startSession] globalIce servers count:", globalIce.length);
+      console.log("[startSession] attemptPolicy stages:", attemptPolicy.length > 0 ? attemptPolicy.map(p => p.stageName) : "none — using defaults");
+
+      const plans = buildPlans(attemptPolicy, globalIce);
+      console.log(`[startSession] Staged connection plan: ${plans.map((p) => p.stageName).join(" → ")}`);
+
+      let successStage = null;
+
+      for (let i = 0; i < plans.length; i++) {
+        const plan = plans[i];
+        setStatus(`Trying ${plan.stageName}...`);
+        console.log(`[startSession] ▶ Attempt ${i + 1}/${plans.length} — stage: ${plan.stageName}`, plan);
+
+        const session      = new PeerSession(signalingUrl);
         sessionRef.current = session;
 
         session.onTrack = (stream) => {
           if (videoRef.current) {
             videoRef.current.srcObject = stream;
             videoRef.current.play().catch(() => {});
-            setIsReady(true);
-            setStatus("Connected");
           }
         };
 
@@ -164,28 +254,41 @@ export default function WebRTCSession() {
           cleanupRef.current = null;
         };
 
-        await session.start(sid);
-        pcRef.current = session.pc;
+        try {
+          await session.start(sid, plan);
+          pcRef.current = session.pc;
+          successStage  = plan.stageName;
+          setIsReady(true);
+          setStatus("Connected");
+          console.log(`[startSession] ✅ Connected via: ${plan.stageName}`);
+          break;
+        } catch (err) {
+          console.warn(`[startSession] ❌ Stage ${plan.stageName} failed:`, err.message);
+          session.stop();
+          sessionRef.current = null;
+          if (i === plans.length - 1) {
+            throw new Error(`All connection stages failed. Last: ${err.message}`);
+          }
+        }
+      }
 
-      } catch (err) {
-        setIsError(true);
-        setStatus(`Error: ${err.message}`);
-        throw err;
+      if (successStage) {
+        await reportNetworkClass(sid, jwtRef.current, successStage);
       }
     }
 
     const manager = new ReconnectManager(startSession, {
-      maxRetries: 3,
-      baseDelay: 3000,
+      maxRetries: 0,
     });
     managerRef.current = manager;
     manager.run();
 
     return () => {
       manager.stop();
+      managerRef.current = null;
       cleanupRef.current?.();
       sessionRef.current?.stop();
-      pcRef.current = null;  
+      pcRef.current = null;
     };
   }, []);
 
@@ -195,9 +298,7 @@ export default function WebRTCSession() {
     return `${m}:${s2}`;
   };
 
-  const shortId = sessionId
-    ? sessionId.split("-")[0].toUpperCase()
-    : "—";
+  const shortId = sessionId ? sessionId.split("-")[0].toUpperCase() : "—";
 
   function toggleMute() {
     if (videoRef.current) {
@@ -234,18 +335,14 @@ export default function WebRTCSession() {
         </div>
         <div className="flex items-center gap-3">
           <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium ${
-            isError
-              ? "bg-red-100 text-red-600"
-              : isReady
-              ? "bg-green-100 text-green-800"
-              : "bg-green-100 text-green-600"
+            isError   ? "bg-red-100 text-red-600"
+            : isReady ? "bg-green-100 text-green-800"
+            : "bg-green-100 text-green-600"
           }`}>
             <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-              isError
-                ? "bg-red-500"
-                : isReady
-                ? "bg-[#12b97b]"
-                : "bg-[#12b97b] animate-pulse"
+              isError   ? "bg-red-500"
+              : isReady ? "bg-[#12b97b]"
+              : "bg-[#12b97b] animate-pulse"
             }`} />
             {status}
           </div>
@@ -264,7 +361,10 @@ export default function WebRTCSession() {
             {isError && (
               <button
                 className="mt-4 px-6 py-2.5 bg-[#12b97b] text-white rounded-lg text-sm font-semibold hover:bg-green-600 transition-colors"
-                onClick={() => managerRef.current?.run()}
+                onClick={() => {
+                  sessionStarted = false;
+                  managerRef.current?.run();
+                }}
               >
                 Retry
               </button>

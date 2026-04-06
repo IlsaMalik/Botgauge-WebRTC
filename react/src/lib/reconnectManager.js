@@ -1,11 +1,11 @@
 export class ReconnectManager {
   constructor(startFn, options = {}) {
-    this.startFn = startFn;
-    this.maxRetries = options.maxRetries ?? 1;
-    this.baseDelay = options.baseDelay ?? 1000;
-    this.attempt = 0;
-    this.stopped = false;
-    this.timer = null;
+    this.startFn    = startFn;
+    this.maxRetries = options.maxRetries ?? 3;
+    this.baseDelay  = options.baseDelay  ?? 1000;
+    this.attempt    = 0;
+    this.stopped    = false;
+    this.timer      = null;
   }
 
   async run() {
@@ -25,14 +25,13 @@ export class ReconnectManager {
 
       this.attempt++;
 
-      if (this.attempt >= this.maxRetries) {
+      if (this.attempt > this.maxRetries) {
         console.error("Max retries reached. Giving up.");
         return;
       }
 
-      const delay = this.baseDelay * Math.pow(2, this.attempt);
-      console.warn(`Connection failed. Retrying in ${delay}ms... (attempt ${this.attempt})`);
-
+      const delay = this.baseDelay * Math.pow(2, this.attempt - 1);
+      console.warn(`Retrying in ${delay}ms... (attempt ${this.attempt}/${this.maxRetries})`);
       this.timer = setTimeout(() => this._try(), delay);
     }
   }
