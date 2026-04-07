@@ -93,7 +93,11 @@ export class PeerSession {
         remoteDescSet = true;
         console.log(`[PeerSession][${stageName}] 🧊 Flushing ${remoteQueue.length} queued ICE candidates`);
         for (const c of remoteQueue) {
-          try { await this.pc.addIceCandidate(c); } catch (_) {}
+          try {
+            await this.pc.addIceCandidate(c);
+          } catch {
+            // Ignore malformed/obsolete remote candidates and continue.
+          }
         }
         remoteQueue.length = 0;
 
@@ -111,7 +115,11 @@ export class PeerSession {
           remoteQueue.push(candidate);
         } else {
           console.log(`[PeerSession][${stageName}] 🧊 Adding ICE candidate immediately`);
-          try { await this.pc.addIceCandidate(candidate); } catch (_) {}
+          try {
+            await this.pc.addIceCandidate(candidate);
+          } catch {
+            // Ignore malformed/obsolete remote candidates and continue.
+          }
         }
 
       } else if (msg.type === "offer") {
@@ -151,13 +159,17 @@ export class PeerSession {
     });
 
     this.pc.onicecandidate = ({ candidate }) => {
+      const sdpMid = candidate?.sdpMid ?? null;
+      const sdpMLineIndex = candidate?.sdpMLineIndex ?? null;
       console.log(`[PeerSession][${stageName}] 🧊 Local ICE candidate:`, candidate?.candidate ?? "null (end-of-candidates)");
       this.signaling.send({
         type:          "candidate",
         session_id:    this.sessionId,
         candidate:     candidate?.candidate     ?? null,
-        sdpMid:        candidate?.sdpMid        ?? null,
-        sdpMLineIndex: candidate?.sdpMLineIndex ?? null,
+        sdpMid,
+        sdpMLineIndex,
+        sdp_mid:       sdpMid,
+        sdp_mline_index: sdpMLineIndex,
       });
     };
 

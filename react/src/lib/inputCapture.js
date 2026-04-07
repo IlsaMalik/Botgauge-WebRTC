@@ -23,8 +23,30 @@ export function attachInputCapture(videoEl, channel) {
     const rect = videoEl.getBoundingClientRect();
     const w = videoEl.videoWidth  || 1280;
     const h = videoEl.videoHeight || 720;
-    const x = clamp(Math.round(((e.clientX - rect.left) / rect.width)  * w), 0, w - 1);
-    const y = clamp(Math.round(((e.clientY - rect.top)  / rect.height) * h), 0, h - 1);
+
+    // Account for letterbox/pillarbox from object-fit: contain
+    const elementAspect = rect.width / rect.height;
+    const videoAspect   = w / h;
+
+    let renderW, renderH, offsetX, offsetY;
+
+    if (elementAspect > videoAspect) {
+      // Pillarbox — black bars on left and right
+      renderH = rect.height;
+      renderW = rect.height * videoAspect;
+      offsetX = (rect.width - renderW) / 2;
+      offsetY = 0;
+    } else {
+      // Letterbox — black bars on top and bottom
+      renderW = rect.width;
+      renderH = rect.width / videoAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderH) / 2;
+    }
+
+    const x = clamp(Math.round(((e.clientX - rect.left - offsetX) / renderW) * w), 0, w - 1);
+    const y = clamp(Math.round(((e.clientY - rect.top  - offsetY) / renderH) * h), 0, h - 1);
+
     return { x, y };
   }
 

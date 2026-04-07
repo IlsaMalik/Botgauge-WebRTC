@@ -80,8 +80,12 @@ async function reportNetworkClass(sessionId, jwt, stageName) {
 function buildPlans(attemptPolicy, globalIceServers = []) {
   if (Array.isArray(attemptPolicy) && attemptPolicy.length > 0) {
     return attemptPolicy.map((stage) => {
-      const stageName = String(stage.stageName || "").toLowerCase();
-      let iceServers  = Array.isArray(stage.iceServers) ? stage.iceServers : globalIceServers;
+      const stageName = String(stage.stageName ?? stage.stage_name ?? "").toLowerCase();
+      let iceServers  = Array.isArray(stage.iceServers)
+        ? stage.iceServers
+        : Array.isArray(stage.ice_servers)
+          ? stage.ice_servers
+          : globalIceServers;
 
       if (stageName === "direct") {
         iceServers = [];
@@ -98,8 +102,8 @@ function buildPlans(attemptPolicy, globalIceServers = []) {
       return {
         stageName,
         iceServers,
-        iceTransportPolicy: stage.iceTransportPolicy === "relay" ? "relay" : "all",
-        timeoutMs:          Number(stage.timeoutMs) || 15000,
+        iceTransportPolicy: (stage.iceTransportPolicy ?? stage.ice_transport_policy) === "relay" ? "relay" : "all",
+        timeoutMs:          Number(stage.timeoutMs ?? stage.timeout_ms) || 15000,
       };
     });
   }
@@ -194,6 +198,7 @@ export default function WebRTCSession() {
 
       setIsError(false);
       setIsReady(false);
+      try {
 
       setStatus("Creating session...");
       const jwt = await fetchToken();
@@ -218,7 +223,7 @@ export default function WebRTCSession() {
       }
       console.log("[startSession] Final signalingUrl:", signalingUrl);
       console.log("[startSession] globalIce servers count:", globalIce.length);
-      console.log("[startSession] attemptPolicy stages:", attemptPolicy.length > 0 ? attemptPolicy.map(p => p.stageName) : "none — using defaults");
+      console.log("[startSession] attemptPolicy stages:", attemptPolicy.length > 0 ? attemptPolicy.map((p) => p.stageName ?? p.stage_name) : "none — using defaults");
 
       const plans = buildPlans(attemptPolicy, globalIce);
       console.log(`[startSession] Staged connection plan: ${plans.map((p) => p.stageName).join(" → ")}`);
@@ -274,6 +279,18 @@ export default function WebRTCSession() {
 
       if (successStage) {
         await reportNetworkClass(sid, jwtRef.current, successStage);
+      }
+      } catch (err) {
+        const message = err?.message || String(err);
+        console.error("[startSession] Fatal session start error:", message);
+        setIsReady(false);
+        setIsError(true);
+        setStatus(`Connection failed: ${message}`);
+        cleanupRef.current?.();
+        sessionRef.current?.stop();
+        sessionRef.current = null;
+        pcRef.current = null;
+        throw err;
       }
     }
 
@@ -483,3 +500,4 @@ export default function WebRTCSession() {
     </div>
   );
 }
+
